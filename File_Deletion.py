@@ -7,27 +7,34 @@ import argparse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging Configuration
+logging.basicConfig(
+    filename="file_deletion.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-# Initialize the scheduler
-scheduler = BackgroundScheduler()
+# Persistent Task Storage File
 TASKS_FILE = "tasks.json"
 
-def log_to_mongodb(task_name, details, message, level="INFO"):
+# Initialize Scheduler
+scheduler = BackgroundScheduler()
+
+def log_to_mongodb(task_name, details, status, level="INFO"):
     """Dummy function to simulate MongoDB logging."""
-    logging.info(f"[MongoDB Log] Task: {task_name} | Message: {message} | Details: {details}")
+    logging.info(f"[MongoDB Log] Task: {task_name} | Status: {status} | Details: {details}")
 
 def load_tasks():
-    """Load tasks from a JSON file."""
+    """Load tasks from the JSON file."""
     try:
         with open(TASKS_FILE, "r") as file:
-            return json.load(file)
+            tasks = json.load(file)
+            return tasks if isinstance(tasks, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_tasks(tasks):
-    """Save tasks to a JSON file."""
+    """Save tasks to the JSON file."""
     with open(TASKS_FILE, "w") as file:
         json.dump(tasks, file, indent=4)
 
@@ -59,27 +66,50 @@ def file_deletion_task(task_name, directory, age_days, formats):
 
 def add_file_deletion_task(interval, unit, directory, age_days, formats):
     """Adds a new file deletion task to the scheduler."""
-    tasks = load_tasks()
-    task_name = f"file_deletion_task_{len(tasks) + 1}"
-    new_task_details = {"interval": interval, "unit": unit, "directory": directory, "age_days": age_days, "formats": formats}
+    tasks = load_tasks()  # Load existing tasks
+    task_name = f"file_deletion_task_{len(tasks) + 1}"  # Generate a unique task name
 
-    if new_task_details in tasks.values():
-        print("⚠️ Task with the same interval and details already exists.")
-        return
+    new_task_details = {
+        "interval": interval,
+        "unit": unit,
+        "directory": directory,
+        "age_days": age_days,
+        "formats": formats
+    }
 
+    # Check for duplicates
+    for existing_task_name, existing_task_details in tasks.items():
+        if (
+            existing_task_details["interval"] == interval
+            and existing_task_details["unit"] == unit
+            and existing_task_details["directory"] == directory
+            and existing_task_details["age_days"] == age_days
+            and set(existing_task_details["formats"]) == set(formats)
+        ):
+            print("⚠️ Task with the same interval and details already exists.")
+            return
+
+    # Add the new task to the tasks dictionary
     tasks[task_name] = new_task_details
+
+    # Save the updated tasks dictionary to the JSON file
     save_tasks(tasks)
-    
+
+    # Schedule the task
     trigger = IntervalTrigger(**{unit: interval})
     scheduler.add_job(file_deletion_task, trigger, args=[task_name, directory, age_days, formats], id=task_name)
-    print(f"✅ File deletion task '{task_name}' added successfully.")
+
+    logging.info(f"Added task to delete files in '{directory}' every {interval} {unit}.")
+    log_to_mongodb("add_file_deletion_task", {"directory": directory, "interval": interval, "unit": unit, "age_days": age_days, "formats": formats}, "Task added")
+    print(f"✅ Task '{task_name}' added successfully.")
 
 def list_file_deletion_tasks():
     """Lists all scheduled file deletion tasks."""
     tasks = load_tasks()
     if not tasks:
-        print("⚠️ No scheduled file deletion tasks found.")
+        print("⚠️ No scheduled tasks found.")
         return
+    
     print("\n📌 Scheduled File Deletion Tasks:")
     for task_name, details in tasks.items():
         print(f"🔹 {task_name} - Every {details['interval']} {details['unit']}")
@@ -90,15 +120,25 @@ def list_file_deletion_tasks():
 def remove_file_deletion_task(task_name):
     """Removes a scheduled file deletion task."""
     tasks = load_tasks()
+    
+    # Check if the task exists in the tasks dictionary
     if task_name not in tasks:
         print(f"⚠️ Task '{task_name}' not found.")
         return
+
+    # Remove the task from the tasks dictionary
     del tasks[task_name]
     save_tasks(tasks)
-    try:
+
+    # Remove the task from the scheduler
+    if scheduler.get_job(task_name):  # Check if the job exists in the scheduler
         scheduler.remove_job(task_name)
+        logging.info(f"Removed task '{task_name}'.")
+        log_to_mongodb("remove_file_deletion_task", {"task_id": task_name}, "Task removed")
         print(f"✅ Task '{task_name}' removed successfully.")
-    except Exception:
+    else:
+        logging.warning(f"Task '{task_name}' not found in the scheduler.")
+        log_to_mongodb("remove_file_deletion_task", {"task_id": task_name}, "Task not found in scheduler", level="WARNING")
         print(f"⚠️ Task '{task_name}' was not running but removed from saved tasks.")
 
 def load_and_schedule_tasks():
@@ -118,34 +158,38 @@ def start_scheduler():
         print("🛑 Scheduler stopped.")
         scheduler.shutdown()
 
-# CLI argument parsing
+# CLI Argument Parsing
 parser = argparse.ArgumentParser(description="File Deletion Scheduler")
-parser.add_argument("--add-file-deletion", type=int, help="Add a new file deletion task with interval")
-parser.add_argument("--directory", type=str, help="Directory to scan for files")
+parser.add_argument("--add", type=int, help="Add a new task with interval")
+parser.add_argument("--unit", type=str, choices=["seconds", "minutes", "hours", "days"], help="Time unit for the interval")
+parser.add_argument("--directory", type=str, help="Directory to organize")
 parser.add_argument("--age-days", type=int, help="Delete files older than this number of days")
 parser.add_argument("--formats", nargs="*", default=[], help="List of file formats to delete (e.g., .log .tmp)")
-parser.add_argument("--unit", type=str, choices=["seconds", "minutes", "hours", "days"], help="Time unit for interval")
-parser.add_argument("--list", action="store_true", help="List all scheduled file deletion tasks")
-parser.add_argument("--remove", type=str, help="Remove a scheduled file deletion task by name")
+parser.add_argument("--list", action="store_true", help="List all scheduled tasks")
+parser.add_argument("--remove", type=str, help="Remove a scheduled task by ID")
+
 args = parser.parse_args()
 
-# CLI execution logic
-if args.add_file_deletion:
+# CLI Execution Logic
+if args.add:
     if not all((args.unit, args.directory, args.age_days, args.formats)):
         print("⚠️ Please provide --unit, --directory, --age-days, and --formats.")
         exit(1)
-    add_file_deletion_task(args.add_file_deletion, args.unit, args.directory, args.age_days, args.formats)
-
-if args.list:
+    add_file_deletion_task(args.add, args.unit, args.directory, args.age_days, args.formats)
+elif args.list:
     list_file_deletion_tasks()
-
-if args.remove:
+elif args.remove:
     remove_file_deletion_task(args.remove)
 
+# Load and schedule tasks before parsing commands
+load_and_schedule_tasks()
+
 # Start the scheduler thread only if no other command is given
-if not (args.add_file_deletion or args.list or args.remove):
+if not (args.add or args.list or args.remove):
     scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
     scheduler_thread.start()
+
+    # Keep the main thread alive
     try:
         while True:
             time.sleep(1)
